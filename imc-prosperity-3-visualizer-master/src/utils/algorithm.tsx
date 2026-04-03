@@ -30,6 +30,20 @@ export class AlgorithmParseError extends Error {
   }
 }
 
+interface ImcResultTrade {
+  symbol: string;
+  timestamp: number | string;
+  price: number | string;
+  quantity: number | string;
+  buyer?: string;
+  seller?: string;
+}
+
+interface ImcResultJson {
+  activitiesLog: string;
+  tradeHistory?: ImcResultTrade[];
+}
+
 function getColumnValues(columns: string[], indices: number[]): number[] {
   const values: number[] = [];
 
@@ -58,6 +72,37 @@ function getActivityLogs(logLines: string[]): ActivityLogRow[] {
     }
 
     const columns = line.split(';');
+
+    rows.push({
+      day: Number(columns[0]),
+      timestamp: Number(columns[1]),
+      product: columns[2],
+      bidPrices: getColumnValues(columns, [3, 5, 7]),
+      bidVolumes: getColumnValues(columns, [4, 6, 8]),
+      askPrices: getColumnValues(columns, [9, 11, 13]),
+      askVolumes: getColumnValues(columns, [10, 12, 14]),
+      midPrice: Number(columns[15]),
+      profitLoss: Number(columns[16]),
+    });
+  }
+
+  return rows;
+}
+
+function getActivityRowsFromActivitiesLog(activitiesLog: string): ActivityLogRow[] {
+  const lines = activitiesLog
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line.length > 0);
+
+  if (lines.length <= 1) {
+    return [];
+  }
+
+  const rows: ActivityLogRow[] = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const columns = lines[i].split(';');
 
     rows.push({
       day: Number(columns[0]),
@@ -191,6 +236,164 @@ function decompressDataRow(compressed: CompressedAlgorithmDataRow, sandboxLogs: 
   };
 }
 
+function toOrderMap(prices: number[], volumes: number[], isSell: boolean): Record<number, number> {
+  const orders: Record<number, number> = {};
+
+  for (let i = 0; i < Math.min(prices.length, volumes.length); i++) {
+    const price = prices[i]!;
+    const volume = volumes[i]!;
+    orders[price] = isSell ? -Math.abs(volume) : Math.abs(volume);
+  }
+
+  return orders;
+}
+
+function getAlgorithmDataFromImcResult(activityLogs: ActivityLogRow[], tradeHistory: ImcResultTrade[]): AlgorithmDataRow[] {
+  const booksByTimestamp: Record<number, Record<string, ActivityLogRow>> = {};
+  const products = new Set<string>();
+
+  for (const row of activityLogs) {
+    if (booksByTimestamp[row.timestamp] === undefined) {
+      booksByTimestamp[row.timestamp] = {};
+    }
+
+    booksByTimestamp[row.timestamp]![row.product] = row;
+    products.add(row.product);
+  }
+
+  const sortedProducts = [...products].sort();
+  const timestamps = Object.keys(booksByTimestamp)
+    .map(Number)
+    .sort((a, b) => a - b);
+
+  const ownTradesByTimestamp: Record<number, Record<string, CompressedTrade[]>> = {};
+
+  for (const trade of [...tradeHistory].sort((a, b) => Number(a.timestamp) - Number(b.timestamp))) {
+    const buyer = trade.buyer ?? '';
+    const seller = trade.seller ?? '';
+    if (buyer !== 'SUBMISSION' && seller !== 'SUBMISSION') {
+      continue;
+    }
+
+    const timestamp = Number(trade.timestamp);
+    const symbol = trade.symbol;
+    if (ownTradesByTimestamp[timestamp] === undefined) {
+      ownTradesByTimestamp[timestamp] = {};
+    }
+    if (ownTradesByTimestamp[timestamp]![symbol] === undefined) {
+      ownTradesByTimestamp[timestamp]![symbol] = [];
+    }
+
+    ownTradesByTimestamp[timestamp]![symbol]!.push([
+      symbol,
+      Number(trade.price),
+      Number(trade.quantity),
+      buyer,
+      seller,
+      timestamp,
+    ]);
+  }
+
+  const positionBySymbol: Record<string, number> = {};
+  const positionSnapshots: Record<number, Record<string, number>> = {};
+
+  for (const timestamp of timestamps) {
+    for (const [symbol, trades] of Object.entries(ownTradesByTimestamp[timestamp] ?? {})) {
+      for (const trade of trades) {
+        if (trade[3] === 'SUBMISSION') {
+          positionBySymbol[symbol] = (positionBySymbol[symbol] ?? 0) + trade[2];
+        } else if (trade[4] === 'SUBMISSION') {
+          positionBySymbol[symbol] = (positionBySymbol[symbol] ?? 0) - trade[2];
+        }
+      }
+    }
+
+    positionSnapshots[timestamp] = { ...positionBySymbol };
+  }
+
+  const listings: CompressedListing[] = sortedProducts.map(product => [product, product, 'XIRECS']);
+  const observations: CompressedObservations = [{}, {}];
+
+  const data: AlgorithmDataRow[] = [];
+  for (const timestamp of timestamps) {
+    const orderDepths: Record<ProsperitySymbol, CompressedOrderDepth> = {};
+
+    for (const product of sortedProducts) {
+      const row = booksByTimestamp[timestamp]![product];
+      if (row === undefined) {
+        continue;
+      }
+
+      orderDepths[product] = [
+        toOrderMap(row.bidPrices, row.bidVolumes, false),
+        toOrderMap(row.askPrices, row.askVolumes, true),
+      ];
+    }
+
+    const ownTrades: CompressedTrade[] = [];
+    for (const product of sortedProducts) {
+      ownTrades.push(...(ownTradesByTimestamp[timestamp]?.[product] ?? []));
+    }
+
+    const compressedRow: CompressedAlgorithmDataRow = [
+      [
+        timestamp,
+        '',
+        listings,
+        orderDepths,
+        ownTrades,
+        [],
+        positionSnapshots[timestamp] ?? {},
+        observations,
+      ],
+      [],
+      0,
+      '',
+      '',
+    ];
+
+    data.push(decompressDataRow(compressedRow, ''));
+  }
+
+  return data;
+}
+
+function parseAlgorithmFromImcResultJson(logs: string, summary?: AlgorithmSummary): Algorithm | undefined {
+  try {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(logs);
+    } catch {
+      return undefined;
+    }
+
+    if (typeof parsed !== 'object' || parsed === null || !('activitiesLog' in parsed)) {
+      return undefined;
+    }
+
+    const result = parsed as ImcResultJson;
+    if (typeof result.activitiesLog !== 'string') {
+      return undefined;
+    }
+
+    const tradeHistory = Array.isArray(result.tradeHistory) ? result.tradeHistory : [];
+    const activityLogs = getActivityRowsFromActivitiesLog(result.activitiesLog);
+    const data = getAlgorithmDataFromImcResult(activityLogs, tradeHistory);
+
+    if (activityLogs.length === 0 || data.length === 0) {
+      return undefined;
+    }
+
+    return {
+      summary,
+      activityLogs,
+      data,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 function getAlgorithmData(logLines: string[]): AlgorithmDataRow[] {
   const headerIndex = logLines.indexOf('Sandbox logs:');
   if (headerIndex === -1) {
@@ -251,6 +454,11 @@ function getAlgorithmData(logLines: string[]): AlgorithmDataRow[] {
 }
 
 export function parseAlgorithmLogs(logs: string, summary?: AlgorithmSummary): Algorithm {
+  const parsedImcResult = parseAlgorithmFromImcResultJson(logs, summary);
+  if (parsedImcResult !== undefined) {
+    return parsedImcResult;
+  }
+
   const logLines = logs.trim().split(/\r?\n/);
 
   const activityLogs = getActivityLogs(logLines);
